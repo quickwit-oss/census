@@ -1,39 +1,76 @@
+//! ```rust
+//! extern crate census;
+//! use census::Inventory;
+//!
+//! fn main() {
+//!     let census = Inventory::new();
+//!     let value_1 = census.track(1);
+//! }
+//! ```
+//!
+//!
+//!
+//! let a = census.track(1);
+//let b = census.track(3);
+//{
+//let els = census.list().map(|m| *m).collect::<Vec<_>>();
+//assert_eq!(els, vec![1, 3]);
+//}
+//drop(b);
+//{
+//let els = census.list().map(|m| *m).collect::<Vec<_>>();
+//assert_eq!(els, vec![1]);
+//}
+//let a2 = a.clone();
+//drop(a);
+//{
+//let els = census.list().map(|m| *m).collect::<Vec<_>>();
+//assert_eq!(els, vec![1]);
+//}
+//drop(a2);
+//{
+//let els = census.list().map(|m| *m).collect::<Vec<_>>();
+//assert_eq!(els, vec![   ]);
+//}
 use std::sync::{Arc, RwLock};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub struct Census<T> {
-    items: Arc<RwLock<Vec<ManagedObject<T>>>>,
+/// The `Inventory` register and keeps track of all of the objects alive.
+pub struct Inventory<T> {
+    items: Arc<RwLock<Vec<TrackedObject<T>>>>,
 }
 
-impl<T> Clone for Census<T> {
+impl<T> Clone for Inventory<T> {
     fn clone(&self) -> Self {
-        Census {
+        Inventory {
             items: self.items.clone()
         }
     }
 }
 
-impl<T> Census<T> {
+impl<T> Inventory<T> {
 
-    pub fn new() -> Census<T> {
-        Census {
+    /// Creates a new inventory object
+    pub fn new() -> Inventory<T> {
+        Inventory {
             items: Arc::default()
         }
     }
 
-    pub fn list(&self) -> impl Iterator<Item=ManagedObject<T>> {
+    /// Takes a snapshot of the list of tracked object.
+    pub fn list(&self) -> Vec<TrackedObject<T>> {
         self.items.read()
             .expect("Lock poisoned")
             .clone()
-            .into_iter()
     }
 
-    pub fn create(&self, t: T)  -> ManagedObject<T> {
-        let self_clone: Census<T> = (*self).clone();
+    /// Tracks a given `T` object
+    pub fn track(&self, t: T) -> TrackedObject<T> {
+        let self_clone: Inventory<T> = (*self).clone();
         let mut wlock = self.items.write().expect("Lock poisoned");
         let idx = wlock.len();
-        let managed_object = ManagedObject {
+        let managed_object = TrackedObject {
             census: self_clone,
             inner: Arc::new(Inner {
                 val:t,
@@ -56,7 +93,7 @@ impl<T> Census<T> {
 }
 
 
-impl<T> Drop for ManagedObject<T> {
+impl<T> Drop for TrackedObject<T> {
     fn drop(&mut self) {
         let count_before = self.inner.count.fetch_sub(1, Ordering::SeqCst);
         if count_before == 1 {
@@ -67,10 +104,10 @@ impl<T> Drop for ManagedObject<T> {
     }
 }
 
-impl<T> Clone for ManagedObject<T> {
+impl<T> Clone for TrackedObject<T> {
     fn clone(&self) -> Self {
         self.inner.count.fetch_add(1, Ordering::SeqCst);
-        ManagedObject {
+        TrackedObject {
             census: self.census.clone(),
             inner: self.inner.clone(),
         }
@@ -83,18 +120,26 @@ struct Inner<T> {
     idx: AtomicUsize,
 }
 
-pub struct ManagedObject<T> {
-    census: Census<T>,
+/// A tracked object.
+pub struct TrackedObject<T> {
+    census: Inventory<T>,
     inner: Arc<Inner<T>>,
 }
 
-impl<T> ManagedObject<T> {
+impl<T> TrackedObject<T> {
     fn set_index(&self, pos: usize) {
         self.inner.idx.store(pos, Ordering::SeqCst);
     }
+
+
+    pub fn map<F>(&self, f: F) -> TrackedObject<T>
+        where F: FnOnce(&T)->T {
+        let t = f(&*self);
+        self.census.track(t)
+    }
 }
 
-impl<T> Deref for ManagedObject<T> {
+impl<T> Deref for TrackedObject<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -105,32 +150,61 @@ impl<T> Deref for ManagedObject<T> {
 #[cfg(test)]
 mod tests {
 
-    use super::Census;
+    use super::Inventory;
+
+    #[test]
+    fn test_census_map() {
+        let census = Inventory::new();
+        let a = census.track(1);
+        let _b = a.map(|v| v*7);
+        assert_eq!(
+            census
+                .list()
+                .into_iter()
+                .map(|m| *m)
+                .collect::<Vec<_>>(),
+            vec![1, 7]
+        );
+    }
+
 
     #[test]
     fn test_census() {
-        let census = Census::new();
-        let a = census.create(1);
-        let b = census.create(3);
+        let census = Inventory::new();
+        let _a = census.track(1);
+        let _b = census.track(3);
+        assert_eq!(
+            census
+                .list()
+                .into_iter()
+                .map(|m| *m)
+                .collect::<Vec<_>>(),
+            vec![1, 3]);
+    }
+
+    #[test]
+    fn test_census_2() {
+        let census = Inventory::new();
         {
-            let els = census.list().map(|m| *m).collect::<Vec<_>>();
-            assert_eq!(els, vec![1, 3]);
+            let _a = census.track(1);
+            let _b = census.track(3);
+            // dropping both here
         }
-        drop(b);
-        {
-            let els = census.list().map(|m| *m).collect::<Vec<_>>();
-            assert_eq!(els, vec![1]);
-        }
-        let a2 = a.clone();
+        assert!(census.list().is_empty());
+    }
+
+    #[test]
+    fn test_census_3() {
+        let census = Inventory::new();
+        let a = census.track(1);
+        let _a2 = a.clone();
         drop(a);
-        {
-            let els = census.list().map(|m| *m).collect::<Vec<_>>();
-            assert_eq!(els, vec![1]);
-        }
-        drop(a2);
-        {
-            let els = census.list().map(|m| *m).collect::<Vec<_>>();
-            assert_eq!(els, vec![   ]);
-        }
+        assert_eq!(
+            census.list()
+                .into_iter()
+                .map(|m| *m)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }
