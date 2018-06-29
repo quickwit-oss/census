@@ -5,33 +5,11 @@
 //! fn main() {
 //!     let census = Inventory::new();
 //!     let value_1 = census.track(1);
+//!
 //! }
 //! ```
-//!
-//!
-//!
-//! let a = census.track(1);
-//let b = census.track(3);
-//{
-//let els = census.list().map(|m| *m).collect::<Vec<_>>();
-//assert_eq!(els, vec![1, 3]);
-//}
-//drop(b);
-//{
-//let els = census.list().map(|m| *m).collect::<Vec<_>>();
-//assert_eq!(els, vec![1]);
-//}
-//let a2 = a.clone();
-//drop(a);
-//{
-//let els = census.list().map(|m| *m).collect::<Vec<_>>();
-//assert_eq!(els, vec![1]);
-//}
-//drop(a2);
-//{
-//let els = census.list().map(|m| *m).collect::<Vec<_>>();
-//assert_eq!(els, vec![   ]);
-//}
+
+
 use std::sync::{Arc, RwLock};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,7 +46,9 @@ impl<T> Inventory<T> {
     /// Tracks a given `T` object
     pub fn track(&self, t: T) -> TrackedObject<T> {
         let self_clone: Inventory<T> = (*self).clone();
-        let mut wlock = self.items.write().expect("Lock poisoned");
+        let mut wlock = self.items
+            .write()
+            .expect("Inventory lock poisoned on write");
         let idx = wlock.len();
         let managed_object = TrackedObject {
             census: self_clone,
@@ -82,16 +62,27 @@ impl<T> Inventory<T> {
         managed_object
     }
 
-    fn remove_at(&self, pos: usize) {
-        let mut wlock = self.items.write().expect("Lock poisoned");
-        // no need to do anything if this was the last element
-        wlock.swap_remove(pos);
-        if pos < wlock.len() {
+    fn remove(&self, el: &TrackedObject<T>) {
+        let mut wlock = self.items
+            .write()
+            .expect("Inventory lock poisoned on read");
+        // We need to double check that the ref count is 0, as
+        // the obj could have been cloned in right before taking the lock,
+        // by calling a `list` for instance.
+        let pos = el.index();
+        let ref_count = wlock[pos].inner.count.load(Ordering::SeqCst);
+        if ref_count != 0 {
+            return;
+        }
+        // just pop if this was the last element
+        if pos + 1 == wlock.len() {
+            wlock.pop();
+        } else {
+            wlock.swap_remove(pos);
             wlock[pos].set_index(pos);
         }
     }
 }
-
 
 impl<T> Drop for TrackedObject<T> {
     fn drop(&mut self) {
@@ -99,7 +90,7 @@ impl<T> Drop for TrackedObject<T> {
         if count_before == 1 {
             // this was the last reference.
             // Let's remove our object from the census.
-            self.census.remove_at(self.inner.idx.load(Ordering::SeqCst));
+            self.census.remove(self);
         }
     }
 }
@@ -127,6 +118,11 @@ pub struct TrackedObject<T> {
 }
 
 impl<T> TrackedObject<T> {
+
+    fn index(&self) -> usize {
+        self.inner.idx.load(Ordering::SeqCst)
+    }
+
     fn set_index(&self, pos: usize) {
         self.inner.idx.store(pos, Ordering::SeqCst);
     }
