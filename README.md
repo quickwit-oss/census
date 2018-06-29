@@ -1,4 +1,5 @@
 # Census
+[![Build status](https://ci.appveyor.com/api/projects/status/5eb6wkt9jpr7qqaj?svg=true)](https://ci.appveyor.com/project/fulmicoton/census)
 
 This crate makes it possible to create an inventory object that keeps track of
 instances of a given type.
