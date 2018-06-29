@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+
 /// The `Inventory` register and keeps track of all of the objects alive.
 pub struct Inventory<T> {
     items: Arc<RwLock<Vec<TrackedObject<T>>>>,
@@ -69,11 +70,13 @@ impl<T> Inventory<T> {
         // We need to double check that the ref count is 0, as
         // the obj could have been cloned in right before taking the lock,
         // by calling a `list` for instance.
-        let pos = el.index();
-        let ref_count = wlock[pos].inner.count.load(Ordering::SeqCst);
+        let ref_count = el.inner.count.load(Ordering::SeqCst);
         if ref_count != 0 {
             return;
         }
+
+        let pos = el.index();
+
         // just pop if this was the last element
         if pos + 1 == wlock.len() {
             wlock.pop();
@@ -147,6 +150,7 @@ impl<T> Deref for TrackedObject<T> {
 mod tests {
 
     use super::Inventory;
+    use std::thread;
 
     #[test]
     fn test_census_map() {
@@ -202,5 +206,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+    }
+
+    #[test]
+    fn test_census_race_condition() {
+        let census = Inventory::new();
+        let census_clone = census.clone();
+        thread::spawn(move || {
+            for _ in 0..1_000 {
+                let _a = census_clone.track(1);
+            }
+        });
+        for _ in 0..10_000 {
+            census.list();
+        }
     }
 }
