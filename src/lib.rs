@@ -1,5 +1,4 @@
 //! ```rust
-//! extern crate census;
 //! use census::{Inventory, TrackedObject};
 //!
 //! fn main() {
@@ -19,32 +18,106 @@
 //! }
 //! ```
 
-
-use std::sync::{Arc, RwLock};
+use std::borrow::Borrow;
+use std::mem;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::borrow::Borrow;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+struct InnerInventory<T> {
+    items: Mutex<Vec<TrackedObject<T>>>,
+    condvar: Condvar,
+}
+
+impl<T> Default for InnerInventory<T> {
+    fn default() -> Self {
+        InnerInventory {
+            items: Mutex::new(Vec::new()),
+            condvar: Condvar::default(),
+        }
+    }
+}
+
+enum ChangesIteratorState<'a, T> {
+    Started(MutexGuard<'a, Vec<TrackedObject<T>>>),
+    NotStarted,
+}
+
+struct ChangesIterator<'a, T> {
+    inventory: &'a InnerInventory<T>,
+    state: ChangesIteratorState<'a, T>,
+    objs: Vec<TrackedObject<T>>, //< required in order to remove a dead lock on their drop.
+}
+
+impl<'a, T> ChangesIteratorState<'a, T> {
+    fn advance(
+        self,
+        inventory: &'a InnerInventory<T>,
+        objs_to_drop: Vec<TrackedObject<T>>,
+    ) -> (ChangesIteratorState<'a, T>, Vec<TrackedObject<T>>) {
+        match self {
+            ChangesIteratorState::NotStarted => {
+                let items_guard = inventory.items.lock().unwrap();
+                let items_copy = items_guard.clone();
+                (ChangesIteratorState::Started(items_guard), items_copy)
+            }
+            ChangesIteratorState::Started(mut guard) => {
+                let mut has_changed = false;
+                for obj in objs_to_drop {
+                    has_changed |= obj.consume(&mut guard);
+                }
+                if has_changed {
+                    let items_copy = guard.clone();
+                    (ChangesIteratorState::Started(guard), items_copy)
+                } else {
+                    guard = inventory.condvar.wait(guard).unwrap();
+                    let items_copy = guard.clone();
+                    (ChangesIteratorState::Started(guard), items_copy)
+                }
+            }
+        }
+    }
+}
+
+impl<'a, T> Iterator for ChangesIterator<'a, T> {
+    type Item = Vec<TrackedObject<T>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let state = mem::replace(&mut self.state, ChangesIteratorState::NotStarted);
+        let objs = mem::replace(&mut self.objs, vec![]);
+        let (new_state, items) = state.advance(self.inventory, objs);
+        self.objs = items.clone();
+        self.state = new_state;
+        Some(items)
+    }
+}
 
 /// The `Inventory` register and keeps track of all of the objects alive.
 pub struct Inventory<T> {
-    items: Arc<RwLock<Vec<TrackedObject<T>>>>,
+    inner: Arc<InnerInventory<T>>,
+}
+
+impl<T> Default for Inventory<T> {
+    fn default() -> Self {
+        Inventory {
+            inner: Arc::new(InnerInventory::default()),
+        }
+    }
 }
 
 impl<T> Clone for Inventory<T> {
     fn clone(&self) -> Self {
         Inventory {
-            items: self.items.clone()
+            inner: self.inner.clone(),
         }
     }
 }
 
 impl<T> Inventory<T> {
-
     /// Creates a new inventory object
     pub fn new() -> Inventory<T> {
         Inventory {
-            items: Arc::default()
+            inner: Arc::new(InnerInventory::default()),
         }
     }
 
@@ -58,10 +131,8 @@ impl<T> Inventory<T> {
     /// They will obviously not appear in the snapshot.
     ///
     /// ```rust
-    /// # extern crate census;
-    /// # use census::{Inventory, TrackedObject};
-    /// # fn main() {
-    /// #
+    /// use census::{Inventory, TrackedObject};
+    ///
     /// let inventory = Inventory::new();
     ///
     /// let one = inventory.track("one".to_string());
@@ -73,7 +144,6 @@ impl<T> Inventory<T> {
     ///
     /// // a fresher snapshot would contain our new element.
     /// assert_eq!(inventory.list().len(), 2);
-    /// # }
     /// ```
     ///
     /// Also, the instance in the snapshot itself
@@ -83,7 +153,6 @@ impl<T> Inventory<T> {
     /// all of its instances will be part of the inventory.
     ///
     /// ```rust
-    /// # extern crate census;
     /// # use census::{Inventory, TrackedObject};
     /// # fn main() {
     /// #
@@ -108,34 +177,51 @@ impl<T> Inventory<T> {
     /// ```
     ///
     pub fn list(&self) -> Vec<TrackedObject<T>> {
-        self.items.read()
-            .expect("Lock poisoned")
-            .clone()
+        self.inner.items.lock().expect("Lock poisoned").clone()
+    }
+
+    /// Blocks the current thread until the inventory is empty.
+    ///
+    /// # Disclaimer
+    ///
+    /// Be careful... Since this method is blocking the current thread,
+    /// it is possible it might block the cleanup of some object... leading
+    /// to a deadlock.
+    pub fn changes_iter<'a>(&'a self) -> impl 'a + Iterator<Item = Vec<TrackedObject<T>>> {
+        ChangesIterator {
+            inventory: &self.inner,
+            state: ChangesIteratorState::NotStarted,
+            objs: Vec::new(),
+        }
     }
 
     /// Starts tracking a given `T` object.
     pub fn track(&self, t: T) -> TrackedObject<T> {
         let self_clone: Inventory<T> = (*self).clone();
-        let mut wlock = self.items
-            .write()
+        let mut wlock = self
+            .inner
+            .items
+            .lock()
             .expect("Inventory lock poisoned on write");
         let idx = wlock.len();
         let managed_object = TrackedObject {
             census: self_clone,
             inner: Arc::new(Inner {
-                val:t,
+                val: t,
                 count: AtomicUsize::new(0),
                 idx: AtomicUsize::new(idx),
-            })
+            }),
+            consumed: false,
         };
         wlock.push(managed_object.clone());
         managed_object
     }
 
-    fn remove(&self, el: &TrackedObject<T>) {
-        let mut wlock = self.items
-            .write()
-            .expect("Inventory lock poisoned on read");
+    fn remove_with_lock(
+        &self,
+        el: &TrackedObject<T>,
+        wlock: &mut MutexGuard<Vec<TrackedObject<T>>>,
+    ) {
         // We need to double check that the ref count is 0, as
         // the obj could have been cloned in right before taking the lock,
         // by calling a `list` for instance.
@@ -143,10 +229,8 @@ impl<T> Inventory<T> {
         if ref_count != 0 {
             return;
         }
-
-        let pos = el.index();
-
         // just pop if this was the last element
+        let pos = el.index();
         if pos + 1 == wlock.len() {
             wlock.pop();
         } else {
@@ -158,11 +242,21 @@ impl<T> Inventory<T> {
 
 impl<T> Drop for TrackedObject<T> {
     fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
         let count_before = self.inner.count.fetch_sub(1, Ordering::SeqCst);
         if count_before == 1 {
             // this was the last reference.
             // Let's remove our object from the census.
-            self.census.remove(self);
+            let mut wlock = self
+                .census
+                .inner
+                .items
+                .lock()
+                .expect("Inventory lock poisoned on read");
+            self.census.remove_with_lock(self, &mut wlock);
+            self.census.inner.condvar.notify_all();
         }
     }
 }
@@ -173,7 +267,22 @@ impl<T> Clone for TrackedObject<T> {
         TrackedObject {
             census: self.census.clone(),
             inner: self.inner.clone(),
+            consumed: self.consumed,
         }
+    }
+}
+
+impl<T> TrackedObject<T> {
+    fn consume(mut self, guard: &mut MutexGuard<Vec<TrackedObject<T>>>) -> bool {
+        self.consumed = true; // prevent the drop logic to kick in a second time.
+        let count_before = self.inner.count.fetch_sub(1, Ordering::SeqCst);
+        if count_before > 1 {
+            return false;
+        }
+        // this was the last reference.
+        // Let's remove our object from the census.
+        self.census.remove_with_lock(&self, guard);
+        true
     }
 }
 
@@ -197,10 +306,10 @@ struct Inner<T> {
 pub struct TrackedObject<T> {
     census: Inventory<T>,
     inner: Arc<Inner<T>>,
+    consumed: bool,
 }
 
 impl<T> TrackedObject<T> {
-
     fn index(&self) -> usize {
         self.inner.idx.load(Ordering::SeqCst)
     }
@@ -209,14 +318,12 @@ impl<T> TrackedObject<T> {
         self.inner.idx.store(pos, Ordering::SeqCst);
     }
 
-
     /// Creates a new object from an existing one.
     ///
     /// The new object will be registered
     /// in your original object's inventory.
     ///
     /// ```rust
-    /// # extern crate census;
     /// # use census::{Inventory, TrackedObject};
     /// # fn main() {
     /// #
@@ -231,7 +338,9 @@ impl<T> TrackedObject<T> {
     /// # }
     /// ```
     pub fn map<F>(&self, f: F) -> TrackedObject<T>
-        where F: FnOnce(&T)->T {
+    where
+        F: FnOnce(&T) -> T,
+    {
         let t = f(&*self);
         self.census.track(t)
     }
@@ -267,17 +376,12 @@ mod tests {
     fn test_census_map() {
         let census = Inventory::new();
         let a = census.track(1);
-        let _b = a.map(|v| v*7);
+        let _b = a.map(|v| v * 7);
         assert_eq!(
-            census
-                .list()
-                .into_iter()
-                .map(|m| *m)
-                .collect::<Vec<_>>(),
+            census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
             vec![1, 7]
         );
     }
-
 
     #[test]
     fn test_census() {
@@ -285,12 +389,9 @@ mod tests {
         let _a = census.track(1);
         let _b = census.track(3);
         assert_eq!(
-            census
-                .list()
-                .into_iter()
-                .map(|m| *m)
-                .collect::<Vec<_>>(),
-            vec![1, 3]);
+            census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 
     #[test]
@@ -311,10 +412,7 @@ mod tests {
         let _a2 = a.clone();
         drop(a);
         assert_eq!(
-            census.list()
-                .into_iter()
-                .map(|m| *m)
-                .collect::<Vec<_>>(),
+            census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
             vec![1]
         );
     }
@@ -344,6 +442,30 @@ mod tests {
         });
         for _ in 0..10_000 {
             census.list();
+        }
+    }
+
+    fn test_census_changes_iter_util(el: usize) {
+        let census = Inventory::new();
+        for _ in 0..el {
+            let tracked = census.track(1);
+            thread::spawn(move || {
+                let _tracked = tracked;
+            });
+        }
+        for objs in census.changes_iter() {
+            if objs.len() == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_census_changes_iter() {
+        for _ in 0..100 {
+            for i in 1..20 {
+                test_census_changes_iter_util(i);
+            }
         }
     }
 }
