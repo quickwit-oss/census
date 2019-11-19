@@ -1,21 +1,22 @@
+//! # Census
+//!
+//! Census' `Inventory`  makes it possible to track a set of living items of a specific type.
+//! Items are automatically removed from the `Inventory<T>` as the living item's are dropped.
+//!
 //! ```rust
 //! use census::{Inventory, TrackedObject};
 //!
-//! fn main() {
+//! let inventory = Inventory::new();
 //!
-//!     let inventory = Inventory::new();
+//! //  Each object tracked needs to be registered explicitely in the Inventory.
+//! //  A `TrackedObject<T>` wrapper is then returned.
+//! let one = inventory.track("one".to_string());
+//! let two = inventory.track("two".to_string());
 //!
-//!     //  Each object tracked needs to be registered explicitely in the Inventory.
-//!     //  A `TrackedObject<T>` wrapper is then returned.
-//!     let one = inventory.track("one".to_string());
-//!     let two = inventory.track("two".to_string());
-//!
-//!     // A snapshot  of the list of living instances can be obtained...
-//!     // (no guarantee on their order)
-//!     let living_instances: Vec<TrackedObject<String>> = inventory.list();
-//!     assert_eq!(living_instances.len(), 2);
-//!
-//! }
+//! // A snapshot  of the list of living instances can be obtained...
+//! // (no guarantee on their order)
+//! let living_instances: Vec<TrackedObject<String>> = inventory.list();
+//! assert_eq!(living_instances.len(), 2);
 //! ```
 
 use std::borrow::Borrow;
@@ -46,7 +47,7 @@ enum ChangesIteratorState<'a, T> {
 struct ChangesIterator<'a, T> {
     inventory: &'a InnerInventory<T>,
     state: ChangesIteratorState<'a, T>,
-    objs: Vec<TrackedObject<T>>, //< required in order to remove a dead lock on their drop.
+    items: Vec<TrackedObject<T>>, //< required in order to remove a dead lock on their drop.
 }
 
 impl<'a, T> ChangesIteratorState<'a, T> {
@@ -84,9 +85,9 @@ impl<'a, T> Iterator for ChangesIterator<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let state = mem::replace(&mut self.state, ChangesIteratorState::NotStarted);
-        let objs = mem::replace(&mut self.objs, vec![]);
+        let objs = mem::replace(&mut self.items, vec![]);
         let (new_state, items) = state.advance(self.inventory, objs);
-        self.objs = items.clone();
+        self.items = items.clone();
         self.state = new_state;
         Some(items)
     }
@@ -114,11 +115,9 @@ impl<T> Clone for Inventory<T> {
 }
 
 impl<T> Inventory<T> {
-    /// Creates a new inventory object
+    /// Creates a new inventory.
     pub fn new() -> Inventory<T> {
-        Inventory {
-            inner: Arc::new(InnerInventory::default()),
-        }
+        Inventory::default()
     }
 
     /// Takes a snapshot of the list of tracked object.
@@ -154,8 +153,7 @@ impl<T> Inventory<T> {
     ///
     /// ```rust
     /// # use census::{Inventory, TrackedObject};
-    /// # fn main() {
-    /// #
+    ///
     /// let inventory = Inventory::new();
     ///
     /// let one = inventory.track("one".to_string());
@@ -173,25 +171,28 @@ impl<T> Inventory<T> {
     ///
     /// // `one` is really untracked.
     /// assert!(inventory.list().is_empty());
-    /// # }
     /// ```
     ///
     pub fn list(&self) -> Vec<TrackedObject<T>> {
         self.inner.items.lock().expect("Lock poisoned").clone()
     }
 
-    /// Blocks the current thread until the inventory is empty.
+    /// Returns an `Iterator<Item=Vec<TrackedObject<T>>>` that observes
+    /// the changes in the inventory.
     ///
     /// # Disclaimer
     ///
-    /// Be careful... Since this method is blocking the current thread,
-    /// it is possible it might block the cleanup of some object... leading
-    /// to a deadlock.
+    /// This method is very slow, and is meant to use only on small inventories.
+    /// Between every call to next, the creation of items in the inventory is blocked,
+    /// and is unlocked when `.next()` is called.
+    ///
+    /// `.next()` then returns when the list of tracked object has changed.
+    /// There is no guarantee that all intermediary state are emitted by the iterator.
     pub fn changes_iter<'a>(&'a self) -> impl 'a + Iterator<Item = Vec<TrackedObject<T>>> {
         ChangesIterator {
             inventory: &self.inner,
             state: ChangesIteratorState::NotStarted,
-            objs: Vec::new(),
+            items: Vec::new(),
         }
     }
 
@@ -294,12 +295,9 @@ struct Inner<T> {
 
 /// Your tracked object.
 ///
-///
 /// A tracked object contains reference counting logic and an
-/// `Arc` to your object.
-///
-/// It is cloneable but calling clone will not clone
-/// your internal object.
+/// `Arc` to your object. It is cloneable but calling clone will
+/// not clone your internal object.
 ///
 /// Your object cannot be mutated. You can borrow it using
 /// the `Deref` interface.
@@ -324,9 +322,8 @@ impl<T> TrackedObject<T> {
     /// in your original object's inventory.
     ///
     /// ```rust
-    /// # use census::{Inventory, TrackedObject};
-    /// # fn main() {
-    /// #
+    /// use census::{Inventory, TrackedObject};
+    ///
     /// let inventory = Inventory::new();
     ///
     /// let seven = inventory.track(7);
@@ -335,7 +332,6 @@ impl<T> TrackedObject<T> {
     ///
     /// let living_instances = inventory.list();
     /// assert_eq!(living_instances.len(), 2);
-    /// # }
     /// ```
     pub fn map<F>(&self, f: F) -> TrackedObject<T>
     where
