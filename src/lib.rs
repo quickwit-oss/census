@@ -20,77 +20,67 @@
 //! ```
 
 use std::borrow::Borrow;
-use std::mem;
+use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+
+use std::fmt::{Error, Formatter};
+
+struct Items<T> {
+    alive_count: usize,
+    items: Vec<Weak<T>>,
+}
+
+impl<T> Default for Items<T> {
+    fn default() -> Self {
+        Items {
+            alive_count: 0,
+            items: Vec::new(),
+        }
+    }
+}
+
+impl<T> Items<T> {
+    fn record_birth(&mut self) {
+        self.alive_count += 1;
+    }
+
+    fn record_death(&mut self) {
+        self.alive_count -= 1;
+    }
+
+    fn list_arc(&mut self) -> Vec<Arc<T>> {
+        self.items.iter().flat_map(|weak| weak.upgrade()).collect()
+    }
+
+    fn gc_if_needed(&mut self) {
+        if !self.should_gc() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.items.len() {
+            let should_remove = self.items[i].upgrade().is_none();
+            if should_remove {
+                self.items.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn alive_count(&self) -> usize {
+        self.alive_count
+    }
+
+    fn should_gc(&self) -> bool {
+        self.alive_count * 2 <= self.items.len()
+    }
+}
 
 struct InnerInventory<T> {
-    items: Mutex<Vec<TrackedObject<T>>>,
+    items: Mutex<Items<T>>,
     condvar: Condvar,
-}
-
-impl<T> Default for InnerInventory<T> {
-    fn default() -> Self {
-        InnerInventory {
-            items: Mutex::new(Vec::new()),
-            condvar: Condvar::default(),
-        }
-    }
-}
-
-enum ChangesIteratorState<'a, T> {
-    Started(MutexGuard<'a, Vec<TrackedObject<T>>>),
-    NotStarted,
-}
-
-struct ChangesIterator<'a, T> {
-    inventory: &'a InnerInventory<T>,
-    state: ChangesIteratorState<'a, T>,
-    items: Vec<TrackedObject<T>>, //< required in order to remove a dead lock on their drop.
-}
-
-impl<'a, T> ChangesIteratorState<'a, T> {
-    fn advance(
-        self,
-        inventory: &'a InnerInventory<T>,
-        objs_to_drop: Vec<TrackedObject<T>>,
-    ) -> (ChangesIteratorState<'a, T>, Vec<TrackedObject<T>>) {
-        match self {
-            ChangesIteratorState::NotStarted => {
-                let items_guard = inventory.items.lock().unwrap();
-                let items_copy = items_guard.clone();
-                (ChangesIteratorState::Started(items_guard), items_copy)
-            }
-            ChangesIteratorState::Started(mut guard) => {
-                let mut has_changed = false;
-                for obj in objs_to_drop {
-                    has_changed |= obj.consume(&mut guard);
-                }
-                if has_changed {
-                    let items_copy = guard.clone();
-                    (ChangesIteratorState::Started(guard), items_copy)
-                } else {
-                    guard = inventory.condvar.wait(guard).unwrap();
-                    let items_copy = guard.clone();
-                    (ChangesIteratorState::Started(guard), items_copy)
-                }
-            }
-        }
-    }
-}
-
-impl<'a, T> Iterator for ChangesIterator<'a, T> {
-    type Item = Vec<TrackedObject<T>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let state = mem::replace(&mut self.state, ChangesIteratorState::NotStarted);
-        let objs = mem::replace(&mut self.items, vec![]);
-        let (new_state, items) = state.advance(self.inventory, objs);
-        self.items = items.clone();
-        self.state = new_state;
-        Some(items)
-    }
 }
 
 /// The `Inventory` register and keeps track of all of the objects alive.
@@ -101,7 +91,10 @@ pub struct Inventory<T> {
 impl<T> Default for Inventory<T> {
     fn default() -> Self {
         Inventory {
-            inner: Arc::new(InnerInventory::default()),
+            inner: Arc::new(InnerInventory {
+                items: Mutex::new(Items::default()),
+                condvar: Condvar::new(),
+            }),
         }
     }
 }
@@ -118,6 +111,12 @@ impl<T> Inventory<T> {
     /// Creates a new inventory.
     pub fn new() -> Inventory<T> {
         Inventory::default()
+    }
+
+    fn lock_items(&self) -> MutexGuard<Items<T>> {
+        let mut guard = self.inner.items.lock().unwrap();
+        guard.gc_if_needed();
+        guard
     }
 
     /// Takes a snapshot of the list of tracked object.
@@ -174,123 +173,59 @@ impl<T> Inventory<T> {
     /// ```
     ///
     pub fn list(&self) -> Vec<TrackedObject<T>> {
-        self.inner.items.lock().expect("Lock poisoned").clone()
+        let arc_list = self.lock_items().list_arc();
+        arc_list
+            .into_iter()
+            .map(|item_arc| self.make_track_object(item_arc))
+            .collect()
     }
 
-    /// Returns an `Iterator<Item=Vec<TrackedObject<T>>>` that observes
-    /// the changes in the inventory.
+    /// This function blocks until there are no more items in the inventory.
     ///
-    /// # Disclaimer
+    /// It is a helper calling
+    /// ```ignore
+    /// self.wait_until_predicate(|count| count == 0)
+    /// ```
     ///
-    /// This method is very slow, and is meant to use only on small inventories.
-    /// Between every call to next, the creation of items in the inventory is blocked,
-    /// and is unlocked when `.next()` is called.
+    /// Note it is very easy to misuse this function and create a deadlock.
+    /// For instance, if any living TrackedObject is on the stack at the moment of the call,
+    /// it will not get dropped, and the inventory cannot become empty.
+    pub fn wait_until_empty(&self) {
+        self.wait_until_predicate(|count| count == 0)
+    }
+
+    /// This function blocks until the number of items in the repository matches a specific
+    /// predicate.
     ///
-    /// `.next()` then returns when the list of tracked object has changed.
-    /// There is no guarantee that all intermediary state are emitted by the iterator.
-    pub fn changes_iter<'a>(&'a self) -> impl 'a + Iterator<Item = Vec<TrackedObject<T>>> {
-        ChangesIterator {
-            inventory: &self.inner,
-            state: ChangesIteratorState::NotStarted,
-            items: Vec::new(),
+    /// See also `wait_until_empty`.
+    ///
+    /// Note it is very easy to misuse this function and create a deadlock.
+    /// For instance, if any living TrackedObject is on the stack at the moment of the call,
+    /// it will not get dropped, and the inventory cannot become empty.
+    pub fn wait_until_predicate<F: Fn(usize) -> bool>(&self, predicate_on_count: F) {
+        let mut count = self.lock_items();
+        while !predicate_on_count(count.alive_count()) {
+            count = self.inner.condvar.wait(count).unwrap();
+        }
+    }
+
+    fn make_track_object(&self, item: Arc<T>) -> TrackedObject<T> {
+        TrackedObject {
+            census: self.clone(),
+            item: Some(item),
         }
     }
 
     /// Starts tracking a given `T` object.
-    pub fn track(&self, t: T) -> TrackedObject<T> {
-        let self_clone: Inventory<T> = (*self).clone();
-        let mut wlock = self
-            .inner
-            .items
-            .lock()
-            .expect("Inventory lock poisoned on write");
-        let idx = wlock.len();
-        let managed_object = TrackedObject {
-            census: self_clone,
-            inner: Arc::new(Inner {
-                val: t,
-                count: AtomicUsize::new(0),
-                idx: AtomicUsize::new(idx),
-            }),
-            consumed: false,
-        };
-        wlock.push(managed_object.clone());
-        managed_object
+    pub fn track(&self, item: T) -> TrackedObject<T> {
+        let item_arc = Arc::new(item);
+        let item_weak = Arc::downgrade(&item_arc);
+        let mut items_lock = self.lock_items();
+        items_lock.items.push(item_weak);
+        items_lock.record_birth();
+        self.inner.condvar.notify_all();
+        self.make_track_object(item_arc)
     }
-
-    fn remove_with_lock(
-        &self,
-        el: &TrackedObject<T>,
-        wlock: &mut MutexGuard<Vec<TrackedObject<T>>>,
-    ) {
-        // We need to double check that the ref count is 0, as
-        // the obj could have been cloned in right before taking the lock,
-        // by calling a `list` for instance.
-        let ref_count = el.inner.count.load(Ordering::SeqCst);
-        if ref_count != 0 {
-            return;
-        }
-        // just pop if this was the last element
-        let pos = el.index();
-        if pos + 1 == wlock.len() {
-            wlock.pop();
-        } else {
-            wlock.swap_remove(pos);
-            wlock[pos].set_index(pos);
-        }
-    }
-}
-
-impl<T> Drop for TrackedObject<T> {
-    fn drop(&mut self) {
-        if self.consumed {
-            return;
-        }
-        let count_before = self.inner.count.fetch_sub(1, Ordering::SeqCst);
-        if count_before == 1 {
-            // this was the last reference.
-            // Let's remove our object from the census.
-            let mut wlock = self
-                .census
-                .inner
-                .items
-                .lock()
-                .expect("Inventory lock poisoned on read");
-            self.census.remove_with_lock(self, &mut wlock);
-            self.census.inner.condvar.notify_all();
-        }
-    }
-}
-
-impl<T> Clone for TrackedObject<T> {
-    fn clone(&self) -> Self {
-        self.inner.count.fetch_add(1, Ordering::SeqCst);
-        TrackedObject {
-            census: self.census.clone(),
-            inner: self.inner.clone(),
-            consumed: self.consumed,
-        }
-    }
-}
-
-impl<T> TrackedObject<T> {
-    fn consume(mut self, guard: &mut MutexGuard<Vec<TrackedObject<T>>>) -> bool {
-        self.consumed = true; // prevent the drop logic to kick in a second time.
-        let count_before = self.inner.count.fetch_sub(1, Ordering::SeqCst);
-        if count_before > 1 {
-            return false;
-        }
-        // this was the last reference.
-        // Let's remove our object from the census.
-        self.census.remove_with_lock(&self, guard);
-        true
-    }
-}
-
-struct Inner<T> {
-    val: T,
-    count: AtomicUsize,
-    idx: AtomicUsize,
 }
 
 /// Your tracked object.
@@ -301,21 +236,19 @@ struct Inner<T> {
 ///
 /// Your object cannot be mutated. You can borrow it using
 /// the `Deref` interface.
+#[derive(Clone)]
 pub struct TrackedObject<T> {
     census: Inventory<T>,
-    inner: Arc<Inner<T>>,
-    consumed: bool,
+    item: Option<Arc<T>>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for TrackedObject<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "Tracked({:?})", self.item)
+    }
 }
 
 impl<T> TrackedObject<T> {
-    fn index(&self) -> usize {
-        self.inner.idx.load(Ordering::SeqCst)
-    }
-
-    fn set_index(&self, pos: usize) {
-        self.inner.idx.store(pos, Ordering::SeqCst);
-    }
-
     /// Creates a new object from an existing one.
     ///
     /// The new object will be registered
@@ -337,8 +270,23 @@ impl<T> TrackedObject<T> {
     where
         F: FnOnce(&T) -> T,
     {
-        let t = f(&*self);
+        let t = f(&self);
         self.census.track(t)
+    }
+}
+
+impl<T> Drop for TrackedObject<T> {
+    fn drop(&mut self) {
+        let mut lock = self.census.lock_items();
+        let obj = self.item.take().unwrap();
+        let weak: Weak<T> = Arc::downgrade(&obj);
+        std::mem::drop(obj);
+        if weak.upgrade().is_none() {
+            // this object was the last of its kind.
+            // TODO we can rely on strong_count once it is stabilized.
+            lock.record_death();
+            self.census.inner.condvar.notify_all();
+        }
     }
 }
 
@@ -346,19 +294,19 @@ impl<T> Deref for TrackedObject<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner.val
+        self.item.as_ref().unwrap()
     }
 }
 
 impl<T> AsRef<T> for TrackedObject<T> {
     fn as_ref(&self) -> &T {
-        &self.inner.val
+        self.item.as_ref().unwrap()
     }
 }
 
 impl<T> Borrow<T> for TrackedObject<T> {
     fn borrow(&self) -> &T {
-        &self.inner.val
+        self.item.as_ref().unwrap()
     }
 }
 
@@ -436,32 +384,28 @@ mod tests {
                 let _a = census_clone.track(1);
             }
         });
-        for _ in 0..10_000 {
+        for i in 0..10_000 {
+            println!("i {}", i);
             census.list();
         }
     }
 
     fn test_census_changes_iter_util(el: usize) {
         let census = Inventory::new();
-        for _ in 0..el {
-            let tracked = census.track(1);
+        for i in 0..el {
+            let tracked = census.track(i);
             thread::spawn(move || {
                 let _tracked = tracked;
             });
         }
-        for objs in census.changes_iter() {
-            if objs.len() == 0 {
-                break;
-            }
-        }
+        census.wait_until_empty();
+        assert!(census.list().is_empty());
     }
 
     #[test]
-    fn test_census_changes_iter() {
-        for _ in 0..100 {
-            for i in 1..20 {
-                test_census_changes_iter_util(i);
-            }
+    fn test_census_changes_iter_many() {
+        for i in 1..200 {
+            test_census_changes_iter_util(i);
         }
     }
 }
