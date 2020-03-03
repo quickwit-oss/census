@@ -29,7 +29,7 @@ use std::fmt::{Error, Formatter};
 
 struct Items<T> {
     alive_count: usize,
-    items: Vec<Weak<T>>,
+    items: Vec<Weak<InnerTrackedObject<T>>>,
 }
 
 impl<T> Default for Items<T> {
@@ -50,8 +50,12 @@ impl<T> Items<T> {
         self.alive_count -= 1;
     }
 
-    fn list_arc(&mut self) -> Vec<Arc<T>> {
-        self.items.iter().flat_map(|weak| weak.upgrade()).collect()
+    fn list_arc(&mut self) -> Vec<TrackedObject<T>> {
+        self.items
+            .iter()
+            .flat_map(|weak| weak.upgrade())
+            .map(|v| TrackedObject { inner: v })
+            .collect()
     }
 
     fn gc_if_needed(&mut self) {
@@ -60,7 +64,7 @@ impl<T> Items<T> {
         }
         let mut i = 0;
         while i < self.items.len() {
-            let should_remove = self.items[i].upgrade().is_none();
+            let should_remove = self.items[i].strong_count() == 0;
             if should_remove {
                 self.items.swap_remove(i);
             } else {
@@ -173,11 +177,7 @@ impl<T> Inventory<T> {
     /// ```
     ///
     pub fn list(&self) -> Vec<TrackedObject<T>> {
-        let arc_list = self.lock_items().list_arc();
-        arc_list
-            .into_iter()
-            .map(|item_arc| self.make_track_object(item_arc))
-            .collect()
+        self.lock_items().list_arc()
     }
 
     /// This function blocks until there are no more items in the inventory.
@@ -209,22 +209,18 @@ impl<T> Inventory<T> {
         }
     }
 
-    fn make_track_object(&self, item: Arc<T>) -> TrackedObject<T> {
-        TrackedObject {
-            census: self.clone(),
-            item: Some(item),
-        }
-    }
-
     /// Starts tracking a given `T` object.
     pub fn track(&self, item: T) -> TrackedObject<T> {
-        let item_arc = Arc::new(item);
+        let item_arc = Arc::new(InnerTrackedObject {
+            census: self.clone(),
+            item,
+        });
         let item_weak = Arc::downgrade(&item_arc);
         let mut items_lock = self.lock_items();
         items_lock.items.push(item_weak);
         items_lock.record_birth();
         self.inner.condvar.notify_all();
-        self.make_track_object(item_arc)
+        TrackedObject { inner: item_arc }
     }
 }
 
@@ -238,13 +234,17 @@ impl<T> Inventory<T> {
 /// the `Deref` interface.
 #[derive(Clone)]
 pub struct TrackedObject<T> {
+    inner: Arc<InnerTrackedObject<T>>,
+}
+
+struct InnerTrackedObject<T> {
     census: Inventory<T>,
-    item: Option<Arc<T>>,
+    item: T,
 }
 
 impl<T: fmt::Debug> fmt::Debug for TrackedObject<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "Tracked({:?})", self.item)
+        write!(f, "Tracked({:?})", self.inner.item)
     }
 }
 
@@ -271,22 +271,15 @@ impl<T> TrackedObject<T> {
         F: FnOnce(&T) -> T,
     {
         let t = f(&self);
-        self.census.track(t)
+        self.inner.census.track(t)
     }
 }
 
-impl<T> Drop for TrackedObject<T> {
+impl<T> Drop for InnerTrackedObject<T> {
     fn drop(&mut self) {
         let mut lock = self.census.lock_items();
-        let obj = self.item.take().unwrap();
-        let weak: Weak<T> = Arc::downgrade(&obj);
-        std::mem::drop(obj);
-        if weak.upgrade().is_none() {
-            // this object was the last of its kind.
-            // TODO we can rely on strong_count once it is stabilized.
-            lock.record_death();
-            self.census.inner.condvar.notify_all();
-        }
+        lock.record_death();
+        self.census.inner.condvar.notify_all();
     }
 }
 
@@ -294,19 +287,19 @@ impl<T> Deref for TrackedObject<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.item.as_ref().unwrap()
+        &self.inner.item
     }
 }
 
 impl<T> AsRef<T> for TrackedObject<T> {
     fn as_ref(&self) -> &T {
-        self.item.as_ref().unwrap()
+        &self.inner.item
     }
 }
 
 impl<T> Borrow<T> for TrackedObject<T> {
     fn borrow(&self) -> &T {
-        self.item.as_ref().unwrap()
+        &self.inner.item
     }
 }
 
@@ -314,6 +307,8 @@ impl<T> Borrow<T> for TrackedObject<T> {
 mod tests {
 
     use super::Inventory;
+    use std::sync::mpsc::channel;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[test]
@@ -388,6 +383,37 @@ mod tests {
             println!("i {}", i);
             census.list();
         }
+    }
+
+    #[test]
+    fn test_census_concurrent_drop() {
+        let census = Inventory::new();
+        let mut senders = Vec::new();
+        let mut handles = Vec::new();
+        let barrier = Arc::new(Barrier::new(2));
+        for _ in 0..2 {
+            let (send, recv) = channel();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                for obj in recv {
+                    barrier.wait();
+                    drop(obj);
+                }
+            }));
+            senders.push(send);
+        }
+        for i in 0..50_000 {
+            let tracked = census.track(i);
+            for send in &senders {
+                send.send(tracked.clone()).unwrap();
+            }
+        }
+        drop(senders);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(census.lock_items().alive_count(), 0);
     }
 
     fn test_census_changes_iter_util(el: usize) {
