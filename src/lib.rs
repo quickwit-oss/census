@@ -23,84 +23,48 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
+use std::collections::HashMap;
 use std::fmt::{Error, Formatter};
 
 struct Items<T> {
-    alive_count: usize,
-    items: Vec<Weak<InnerTrackedObject<T>>>,
+    last_idx: u64,
+    items: HashMap<u64, Weak<InnerTrackedObject<T>>>,
 }
 
 impl<T> Default for Items<T> {
     fn default() -> Self {
         Items {
-            alive_count: 0,
-            items: Vec::new(),
+            last_idx: 0u64,
+            items: HashMap::new(),
         }
     }
 }
 
 impl<T> Items<T> {
-    fn record_birth(&mut self) {
-        self.alive_count += 1;
-    }
-
-    fn record_death(&mut self) {
-        self.alive_count -= 1;
-    }
-
     fn list_arc(&mut self) -> Vec<TrackedObject<T>> {
         self.items
-            .iter()
+            .values()
             .flat_map(|weak| weak.upgrade())
-            .map(|v| TrackedObject { inner: v })
+            .map(|inner| TrackedObject { inner })
             .collect()
-    }
-
-    fn gc_if_needed(&mut self) {
-        if !self.should_gc() {
-            return;
-        }
-        let mut i = 0;
-        while i < self.items.len() {
-            let should_remove = self.items[i].strong_count() == 0;
-            if should_remove {
-                self.items.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    fn alive_count(&self) -> usize {
-        self.alive_count
-    }
-
-    fn should_gc(&self) -> bool {
-        self.alive_count * 2 <= self.items.len()
     }
 }
 
 struct InnerInventory<T> {
     items: Mutex<Items<T>>,
-    condvar: Condvar,
+}
+
+impl<T> InnerInventory<T> {
+    fn record_drop(&self, idx: u64) {
+        self.items.lock().unwrap().items.remove(&idx);
+    }
 }
 
 /// The `Inventory` register and keeps track of all of the objects alive.
 pub struct Inventory<T> {
     inner: Arc<InnerInventory<T>>,
-}
-
-impl<T> Default for Inventory<T> {
-    fn default() -> Self {
-        Inventory {
-            inner: Arc::new(InnerInventory {
-                items: Mutex::new(Items::default()),
-                condvar: Condvar::new(),
-            }),
-        }
-    }
 }
 
 impl<T> Clone for Inventory<T> {
@@ -111,16 +75,20 @@ impl<T> Clone for Inventory<T> {
     }
 }
 
+impl<T> Default for Inventory<T> {
+    fn default() -> Self {
+        Inventory {
+            inner: Arc::new(InnerInventory {
+                items: Mutex::new(Items::default()),
+            }),
+        }
+    }
+}
+
 impl<T> Inventory<T> {
     /// Creates a new inventory.
     pub fn new() -> Inventory<T> {
         Inventory::default()
-    }
-
-    fn lock_items(&self) -> MutexGuard<Items<T>> {
-        let mut guard = self.inner.items.lock().unwrap();
-        guard.gc_if_needed();
-        guard
     }
 
     /// Takes a snapshot of the list of tracked object.
@@ -177,49 +145,22 @@ impl<T> Inventory<T> {
     /// ```
     ///
     pub fn list(&self) -> Vec<TrackedObject<T>> {
-        self.lock_items().list_arc()
-    }
-
-    /// This function blocks until there are no more items in the inventory.
-    ///
-    /// It is a helper calling
-    /// ```ignore
-    /// self.wait_until_predicate(|count| count == 0)
-    /// ```
-    ///
-    /// Note it is very easy to misuse this function and create a deadlock.
-    /// For instance, if any living TrackedObject is on the stack at the moment of the call,
-    /// it will not get dropped, and the inventory cannot become empty.
-    pub fn wait_until_empty(&self) {
-        self.wait_until_predicate(|count| count == 0)
-    }
-
-    /// This function blocks until the number of items in the repository matches a specific
-    /// predicate.
-    ///
-    /// See also `wait_until_empty`.
-    ///
-    /// Note it is very easy to misuse this function and create a deadlock.
-    /// For instance, if any living TrackedObject is on the stack at the moment of the call,
-    /// it will not get dropped, and the inventory cannot become empty.
-    pub fn wait_until_predicate<F: Fn(usize) -> bool>(&self, predicate_on_count: F) {
-        let mut count = self.lock_items();
-        while !predicate_on_count(count.alive_count()) {
-            count = self.inner.condvar.wait(count).unwrap();
-        }
+        let mut lock = self.inner.items.lock().unwrap();
+        lock.list_arc()
     }
 
     /// Starts tracking a given `T` object.
     pub fn track(&self, item: T) -> TrackedObject<T> {
+        let mut lock = self.inner.items.lock().unwrap();
+        let idx = lock.last_idx;
+        lock.last_idx += 1;
         let item_arc = Arc::new(InnerTrackedObject {
             census: self.clone(),
             item,
+            idx,
         });
         let item_weak = Arc::downgrade(&item_arc);
-        let mut items_lock = self.lock_items();
-        items_lock.items.push(item_weak);
-        items_lock.record_birth();
-        self.inner.condvar.notify_all();
+        lock.items.insert(idx, item_weak);
         TrackedObject { inner: item_arc }
     }
 }
@@ -240,6 +181,7 @@ pub struct TrackedObject<T> {
 struct InnerTrackedObject<T> {
     census: Inventory<T>,
     item: T,
+    idx: u64,
 }
 
 impl<T: fmt::Debug> fmt::Debug for TrackedObject<T> {
@@ -277,9 +219,7 @@ impl<T> TrackedObject<T> {
 
 impl<T> Drop for InnerTrackedObject<T> {
     fn drop(&mut self) {
-        let mut lock = self.census.lock_items();
-        lock.record_death();
-        self.census.inner.condvar.notify_all();
+        self.census.inner.record_drop(self.idx);
     }
 }
 
@@ -316,10 +256,9 @@ mod tests {
         let census = Inventory::new();
         let a = census.track(1);
         let _b = a.map(|v| v * 7);
-        assert_eq!(
-            census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
-            vec![1, 7]
-        );
+        let mut els = census.list().into_iter().map(|m| *m).collect::<Vec<_>>();
+        els.sort();
+        assert_eq!(els, vec![1, 7]);
     }
 
     #[test]
@@ -327,10 +266,9 @@ mod tests {
         let census = Inventory::new();
         let _a = census.track(1);
         let _b = census.track(3);
-        assert_eq!(
-            census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
-            vec![1, 3]
-        );
+        let mut els = census.list().into_iter().map(|m| *m).collect::<Vec<_>>();
+        els.sort();
+        assert_eq!(els, vec![1, 3]);
     }
 
     #[test]
@@ -379,8 +317,7 @@ mod tests {
                 let _a = census_clone.track(1);
             }
         });
-        for i in 0..10_000 {
-            println!("i {}", i);
+        for _ in 0..10_000 {
             census.list();
         }
     }
@@ -413,25 +350,6 @@ mod tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(census.lock_items().alive_count(), 0);
-    }
-
-    fn test_census_changes_iter_util(el: usize) {
-        let census = Inventory::new();
-        for i in 0..el {
-            let tracked = census.track(i);
-            thread::spawn(move || {
-                let _tracked = tracked;
-            });
-        }
-        census.wait_until_empty();
         assert!(census.list().is_empty());
-    }
-
-    #[test]
-    fn test_census_changes_iter_many() {
-        for i in 1..200 {
-            test_census_changes_iter_util(i);
-        }
     }
 }
