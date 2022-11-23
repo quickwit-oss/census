@@ -270,7 +270,7 @@ impl<T> TrackedObject<T> {
     where
         F: FnOnce(&T) -> T,
     {
-        let t = f(&self);
+        let t = f(self);
         self.inner.census.track(t)
     }
 }
