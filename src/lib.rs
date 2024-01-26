@@ -50,6 +50,10 @@ impl<T> Items<T> {
         self.alive_count -= 1;
     }
 
+    fn len(&mut self) -> usize {
+        self.alive_count()
+    }
+
     fn list_arc(&mut self) -> Vec<TrackedObject<T>> {
         self.items
             .iter()
@@ -121,6 +125,11 @@ impl<T> Inventory<T> {
         let mut guard = self.inner.items.lock().unwrap();
         guard.gc_if_needed();
         guard
+    }
+
+    /// Returns the number of tracked object.
+    pub fn len(&self) -> usize {
+        self.lock_items().len()
     }
 
     /// Takes a snapshot of the list of tracked object.
@@ -316,6 +325,7 @@ mod tests {
         let census = Inventory::new();
         let a = census.track(1);
         let _b = a.map(|v| v * 7);
+        assert_eq!(census.len(), 2);
         assert_eq!(
             census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
             vec![1, 7]
@@ -327,6 +337,7 @@ mod tests {
         let census = Inventory::new();
         let _a = census.track(1);
         let _b = census.track(3);
+        assert_eq!(census.len(), 2,);
         assert_eq!(
             census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
             vec![1, 3]
@@ -341,6 +352,7 @@ mod tests {
             let _b = census.track(3);
             // dropping both here
         }
+        assert_eq!(census.len(), 0);
         assert!(census.list().is_empty());
     }
 
@@ -350,6 +362,7 @@ mod tests {
         let a = census.track(1);
         let _a2 = a.clone();
         drop(a);
+        assert_eq!(census.len(), 1);
         assert_eq!(
             census.list().into_iter().map(|m| *m).collect::<Vec<_>>(),
             vec![1]
@@ -367,6 +380,7 @@ mod tests {
         assert_eq!(living_2.len(), 1);
         drop(living_2);
         drop(living);
+        assert_eq!(census.len(), 0);
         assert!(census.list().is_empty());
     }
 
@@ -412,8 +426,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        assert_eq!(census.lock_items().alive_count(), 0);
+        assert_eq!(census.len(), 0);
     }
 
     fn test_census_changes_iter_util(el: usize) {
@@ -425,6 +438,7 @@ mod tests {
             });
         }
         census.wait_until_empty();
+        assert_eq!(census.len(), 0);
         assert!(census.list().is_empty());
     }
 
